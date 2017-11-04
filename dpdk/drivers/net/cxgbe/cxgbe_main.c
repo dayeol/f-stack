@@ -57,6 +57,7 @@
 #include <rte_alarm.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
+#include <rte_ethdev_pci.h>
 #include <rte_atomic.h>
 #include <rte_malloc.h>
 #include <rte_random.h>
@@ -959,7 +960,7 @@ int setup_rss(struct port_info *pi)
 	dev_debug(adapter, "%s:  pi->rss_size = %u; pi->n_rx_qsets = %u\n",
 		  __func__, pi->rss_size, pi->n_rx_qsets);
 
-	if (!pi->flags & PORT_RSS_DONE) {
+	if (!(pi->flags & PORT_RSS_DONE)) {
 		if (adapter->flags & FULL_INIT_DONE) {
 			/* Fill default values with equal distribution */
 			for (j = 0; j < pi->rss_size; j++)
@@ -977,33 +978,22 @@ int setup_rss(struct port_info *pi)
 /*
  * Enable NAPI scheduling and interrupt generation for all Rx queues.
  */
-static void enable_rx(struct adapter *adap)
+static void enable_rx(struct adapter *adap, struct sge_rspq *q)
 {
-	struct sge *s = &adap->sge;
-	struct sge_rspq *q = &s->fw_evtq;
-	int i, j;
-
 	/* 0-increment GTS to start the timer and enable interrupts */
 	t4_write_reg(adap, MYPF_REG(A_SGE_PF_GTS),
 		     V_SEINTARM(q->intr_params) |
 		     V_INGRESSQID(q->cntxt_id));
+}
 
-	for_each_port(adap, i) {
-		const struct port_info *pi = &adap->port[i];
-		struct rte_eth_dev *eth_dev = pi->eth_dev;
+void cxgbe_enable_rx_queues(struct port_info *pi)
+{
+	struct adapter *adap = pi->adapter;
+	struct sge *s = &adap->sge;
+	unsigned int i;
 
-		for (j = 0; j < eth_dev->data->nb_rx_queues; j++) {
-			q = eth_dev->data->rx_queues[j];
-
-			/*
-			 * 0-increment GTS to start the timer and enable
-			 * interrupts
-			 */
-			t4_write_reg(adap, MYPF_REG(A_SGE_PF_GTS),
-				     V_SEINTARM(q->intr_params) |
-				     V_INGRESSQID(q->cntxt_id));
-		}
-	}
+	for (i = 0; i < pi->n_rx_qsets; i++)
+		enable_rx(adap, &s->ethrxq[pi->first_qset + i].rspq);
 }
 
 /**
@@ -1016,7 +1006,7 @@ static void enable_rx(struct adapter *adap)
  */
 int cxgbe_up(struct adapter *adap)
 {
-	enable_rx(adap);
+	enable_rx(adap, &adap->sge.fw_evtq);
 	t4_sge_tx_monitor_start(adap);
 	t4_intr_enable(adap);
 	adap->flags |= FULL_INIT_DONE;
@@ -1150,7 +1140,7 @@ int cxgbe_probe(struct adapter *adapter)
 		 */
 
 		/* reserve an ethdev entry */
-		pi->eth_dev = rte_eth_dev_allocate(name, RTE_ETH_DEV_PCI);
+		pi->eth_dev = rte_eth_dev_allocate(name);
 		if (!pi->eth_dev)
 			goto out_free;
 
@@ -1163,16 +1153,13 @@ int cxgbe_probe(struct adapter *adapter)
 		pi->eth_dev->data = data;
 
 allocate_mac:
-		pi->eth_dev->pci_dev = adapter->pdev;
+		pi->eth_dev->device = &adapter->pdev->device;
 		pi->eth_dev->data->dev_private = pi;
-		pi->eth_dev->driver = adapter->eth_dev->driver;
 		pi->eth_dev->dev_ops = adapter->eth_dev->dev_ops;
 		pi->eth_dev->tx_pkt_burst = adapter->eth_dev->tx_pkt_burst;
 		pi->eth_dev->rx_pkt_burst = adapter->eth_dev->rx_pkt_burst;
 
-		rte_eth_copy_pci_info(pi->eth_dev, pi->eth_dev->pci_dev);
-
-		TAILQ_INIT(&pi->eth_dev->link_intr_cbs);
+		rte_eth_copy_pci_info(pi->eth_dev, adapter->pdev);
 
 		pi->eth_dev->data->mac_addrs = rte_zmalloc(name,
 							   ETHER_ADDR_LEN, 0);
